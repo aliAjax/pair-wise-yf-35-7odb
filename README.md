@@ -24,7 +24,19 @@ python3 app.py --db ./data.db --port 8301
 
 ## 核心对象
 
-- `athlete`：运动员；`sample`：检测样本；`case`：结果管理案件。
+- `athlete`：运动员；`sample`：检测样本；`case`：结果管理案件；`batch`：送检批次。
+
+## 送检链路（batch）
+
+批次在建批时登记冷链箱（`box_id`）、实验室接收时段（`lab_slot`）、保存期限（`storage_deadline`）和箱位容量（`capacity`），状态机为 `assembling → dispatched → received → closed`，退回时回到 `assembling`（待入批）。
+
+- `add_sample`（inspector/admin）：样本须已采集（`collected`）且未过保存期才能入批；保存期限取样本自身 `storage_deadline`（如有）与批次保存期限中较早者。同一样本不能同时挂在两个未完成批次上；并发入批由数据库事务保证只有一个成功。箱位已满时样本进入 `queued_sample_ids` 排队。
+- `dispatch` / `receive`：发运与实验室签收，箱内样本状态随批次联动（`batched → in_transit → received`）。
+- `lab_return` / `cold_chain_breach`（需 `reason`，可选 `occurred_at`）：整批退回待入批；保存期已过的样本就地作废（`voided`）并写入作废原因，空出的箱位按排队顺序补位。已回传结果的批次禁止退回。
+- `report_result`（lab/admin，需 `sample_id`、`result`、`result_id`、`seq`）：实验室分批回传结果。`result_id` 幂等去重，重复回传不产生任何变更；`seq` 小于等于已应用序号的结果记为乱序，写入 `ignored_results` 而不生效。结论发生变更时，样本结论按新结果更新，但相关案件不会被悄悄改写——案件只被标记 `needs_reconfirmation`，已生效的裁决保持原样。
+- `close`：关闭批次，仍挂在批上的样本释放回 `collected`，可重新入批。
+
+案件在结论变更后需通过 `reconfirm`（panel/admin，`outcome` 为 `upheld` 或 `overturned`）重新确认：`upheld` 维持原状态，`overturned` 将案件置为 `dismissed`。
 
 ## 主要接口
 

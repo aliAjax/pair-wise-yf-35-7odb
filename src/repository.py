@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .domain import ConflictError, NotFoundError
@@ -200,3 +201,93 @@ class SQLiteRepository:
         with self._connect() as connection:
             connection.execute("SELECT 1").fetchone()
         return True
+
+    @contextmanager
+    def transaction(self):
+        """Serialize a multi-entity read-check-write block with BEGIN IMMEDIATE.
+
+        Concurrent transactions queue on the database write lock, so a second
+        writer always re-reads the state committed by the first one.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield RepositoryTransaction(connection)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+
+class RepositoryTransaction:
+    """Entity access bound to a single connection inside SQLiteRepository.transaction."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def get_entity(self, entity_id):
+        row = self.connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return SQLiteRepository._entity_from_row(row) if row else None
+
+    def list_entities(self, kind=None, status=None):
+        clauses = []
+        params = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.connection.execute(
+            "SELECT * FROM entities" + where + " ORDER BY created_at, id", params
+        ).fetchall()
+        return [SQLiteRepository._entity_from_row(row) for row in rows]
+
+    def find_entities(self, kind, field, value):
+        return [
+            entity
+            for entity in self.list_entities(kind=kind)
+            if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
+        ]
+
+    def update_entity(self, entity_id, expected_version, status, data):
+        now = utcnow()
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        row = self.connection.execute(
+            "SELECT version FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError("entity not found: " + entity_id)
+        current_version = int(row["version"])
+        if expected_version is not None and current_version != int(expected_version):
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (expected_version, current_version)
+            )
+        self.connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (status, payload, now, entity_id, current_version),
+        )
+        return self.get_entity(entity_id)
+
+    def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
+        self.connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
